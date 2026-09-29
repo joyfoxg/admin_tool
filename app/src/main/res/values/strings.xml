@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">기기 관리자 관리자</string>
+    <string name="sample_admin_label">AdminTool 기기 관리자</string>
+    <string name="sample_admin_description">시스템 관리 테스트용 기기 관리자 권한입니다.</string>
+</resources>
