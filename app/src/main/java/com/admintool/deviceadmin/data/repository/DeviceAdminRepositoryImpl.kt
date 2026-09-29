@@ -106,15 +106,40 @@ class DeviceAdminRepositoryImpl @Inject constructor(
 
             val hasOverlay = permissions.any { it.permission.contains("SYSTEM_ALERT_WINDOW") && it.isGranted }
             val hasAccessibility = permissions.any { it.permission.contains("BIND_ACCESSIBILITY_SERVICE") && it.isGranted }
+            val policies = mutableListOf<AdminPolicyInfo>()
+            try {
+                val adminInfo = android.app.admin.DeviceAdminInfo(context, resolveInfo)
+                if (adminInfo.usesPolicy(android.app.admin.DeviceAdminInfo.USES_POLICY_DISABLE_CAMERA)) {
+                    policies.add(AdminPolicyInfo("DISABLE_CAMERA", "카메라 사용 제한"))
+                }
+                if (adminInfo.usesPolicy(android.app.admin.DeviceAdminInfo.USES_POLICY_WIPE_DATA)) {
+                    policies.add(AdminPolicyInfo("WIPE_DATA", "원격 데이터 삭제 (공장 초기화)"))
+                }
+                if (adminInfo.usesPolicy(android.app.admin.DeviceAdminInfo.USES_POLICY_RESET_PASSWORD)) {
+                    policies.add(AdminPolicyInfo("RESET_PASSWORD", "화면 잠금 비밀번호 재설정"))
+                }
+                if (adminInfo.usesPolicy(android.app.admin.DeviceAdminInfo.USES_POLICY_LIMIT_PASSWORD)) {
+                    policies.add(AdminPolicyInfo("LIMIT_PASSWORD", "비밀번호 규칙 및 복잡도 강제"))
+                }
+                if (adminInfo.usesPolicy(android.app.admin.DeviceAdminInfo.USES_POLICY_FORCE_LOCK)) {
+                    policies.add(AdminPolicyInfo("FORCE_LOCK", "화면 즉시 강제 잠금"))
+                }
+                if (adminInfo.usesPolicy(android.app.admin.DeviceAdminInfo.USES_ENCRYPTED_STORAGE)) {
+                    policies.add(AdminPolicyInfo("ENCRYPTED_STORAGE", "저장소 암호화 강제"))
+                }
+                if (adminInfo.usesPolicy(android.app.admin.DeviceAdminInfo.USES_POLICY_WATCH_LOGIN)) {
+                    policies.add(AdminPolicyInfo("WATCH_LOGIN", "화면 잠금 실패 횟수 모니터링"))
+                }
+                if (adminInfo.usesPolicy(android.app.admin.DeviceAdminInfo.USES_POLICY_EXPIRE_PASSWORD)) {
+                    policies.add(AdminPolicyInfo("EXPIRE_PASSWORD", "비밀번호 만료 주기 설정"))
+                }
+            } catch (e: Exception) {
+                // If parsing fails fallback
+            }
 
-            val policies = listOf(
-                AdminPolicyInfo("WIPE_DATA", "원격 데이터 삭제"),
-                AdminPolicyInfo("RESET_PASSWORD", "화면 잠금 비밀번호 재설정"),
-                AdminPolicyInfo("LIMIT_PASSWORD", "비밀번호 정책 강제"),
-                AdminPolicyInfo("FORCE_LOCK", "화면 즉시 강제 잠금"),
-                AdminPolicyInfo("DISABLE_CAMERA", "카메라 사용 제한"),
-                AdminPolicyInfo("ENCRYPTED_STORAGE", "저장소 암호화 강제")
-            )
+            if (policies.isEmpty() && isActive) {
+                policies.add(AdminPolicyInfo("GENERAL_ADMIN", "기본 기기 관리자 권한"))
+            }
 
             resultList.add(
                 DeviceAdminApp(
