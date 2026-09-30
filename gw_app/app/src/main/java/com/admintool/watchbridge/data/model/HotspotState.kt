@@ -2,7 +2,7 @@ package com.admintool.watchbridge.data.model
 
 sealed interface HotspotStatus {
     data object Stopped : HotspotStatus
-    data object Starting : HotspotStatus
+    data class Starting(val message: String = "브릿지 모드 준비 중...") : HotspotStatus
     data class Running(
         val ssid: String,
         val password: String,

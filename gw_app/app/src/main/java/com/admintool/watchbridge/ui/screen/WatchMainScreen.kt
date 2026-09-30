@@ -250,7 +250,7 @@ fun WatchMainScreen(
 fun StatusIndicator(status: HotspotStatus) {
     val (text, color) = when (status) {
         is HotspotStatus.Running -> "핫스팟 켜짐 (폰 연결 대기)" to SuccessGreen
-        is HotspotStatus.Starting -> "핫스팟 시작 중..." to Color(0xFFD97706)
+        is HotspotStatus.Starting -> status.message to Color(0xFFD97706)
         is HotspotStatus.Failed -> "핫스팟 오류" to WarningRed
         is HotspotStatus.Stopped -> "핫스팟 꺼짐" to Color.Gray
     }

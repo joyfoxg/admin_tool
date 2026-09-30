@@ -6,6 +6,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.net.NetworkInfo
+import android.net.wifi.WifiInfo
 import android.net.wifi.WifiManager
 import android.net.wifi.p2p.WifiP2pConfig
 import android.net.wifi.p2p.WifiP2pGroup
@@ -46,6 +47,7 @@ class WatchHotspotManager @Inject constructor(
 
     private var isP2pMode = false
     private var receiverRegistered = false
+    private var previousNetworkId: Int = -1
 
     private val p2pReceiver = object : BroadcastReceiver() {
         override fun onReceive(c: Context?, intent: Intent?) {
@@ -62,7 +64,7 @@ class WatchHotspotManager @Inject constructor(
                     val p2pInfo = intent.getParcelableExtra<WifiP2pInfo>(WifiP2pManager.EXTRA_WIFI_P2P_INFO)
                     val group = intent.getParcelableExtra<WifiP2pGroup>(WifiP2pManager.EXTRA_WIFI_P2P_GROUP)
 
-                    Log.d(TAG, "WIFI_P2P_CONNECTION_CHANGED: isConnected=${networkInfo?.isConnected}, groupFormed=${p2pInfo?.groupFormed}, isGO=${p2pInfo?.isGroupOwner}")
+                    Log.d(TAG, "WIFI_P2P_CONNECTION_CHANGED: isConnected=${networkInfo?.isConnected}, groupFormed=${p2pInfo?.groupFormed}")
 
                     if (group != null && (p2pInfo?.isGroupOwner == true || group.isGroupOwner)) {
                         val ssid = group.networkName ?: "DIRECT-Watch-Shizuku"
@@ -115,22 +117,44 @@ class WatchHotspotManager @Inject constructor(
         }
     }
 
+    @SuppressLint("MissingPermission")
     fun startHotspot() {
         if (_hotspotStatus.value is HotspotStatus.Running || _hotspotStatus.value is HotspotStatus.Starting) {
             return
         }
 
-        _hotspotStatus.value = HotspotStatus.Starting
-        Log.i(TAG, "Starting Hotspot Bridge...")
-
-        // If Wi-Fi is connected to an external router, disconnect temporarily so chip can act as AP/P2P Owner
-        try {
-            wifiManager.disconnect()
-        } catch (e: Exception) {
-            Log.w(TAG, "wifiManager.disconnect() ignored: ${e.message}")
+        // Check if Wi-Fi is currently enabled
+        if (!wifiManager.isWifiEnabled) {
+            try {
+                @Suppress("DEPRECATION")
+                wifiManager.isWifiEnabled = true
+            } catch (e: Exception) {
+                Log.w(TAG, "Cannot enable Wi-Fi programmatically: ${e.message}")
+            }
         }
 
-        startWifiDirectGroup()
+        _hotspotStatus.value = HotspotStatus.Starting("기존 Wi-Fi 해제 중...")
+        Log.i(TAG, "Starting Hotspot Bridge: Disconnecting current AP...")
+
+        // Step 1: Disconnect from any connected router
+        try {
+            val connectionInfo: WifiInfo? = wifiManager.connectionInfo
+            if (connectionInfo != null && connectionInfo.networkId != -1) {
+                previousNetworkId = connectionInfo.networkId
+                @Suppress("DEPRECATION")
+                wifiManager.disableNetwork(previousNetworkId)
+            }
+            @Suppress("DEPRECATION")
+            wifiManager.disconnect()
+        } catch (e: Exception) {
+            Log.w(TAG, "wifiManager.disconnect() error: ${e.message}")
+        }
+
+        // Step 2: Allow chip 1.2s to settle in disconnected state before creating AP
+        handler.postDelayed({
+            _hotspotStatus.value = HotspotStatus.Starting("브릿지 AP 생성 중...")
+            startWifiDirectGroup()
+        }, 1200)
     }
 
     @SuppressLint("MissingPermission")
@@ -319,6 +343,19 @@ class WatchHotspotManager @Inject constructor(
             // Ignore close errors
         } finally {
             _hotspotStatus.value = HotspotStatus.Stopped
+
+            // Re-enable and reconnect previous Wi-Fi connection
+            try {
+                if (previousNetworkId != -1) {
+                    @Suppress("DEPRECATION")
+                    wifiManager.enableNetwork(previousNetworkId, false)
+                    previousNetworkId = -1
+                }
+                @Suppress("DEPRECATION")
+                wifiManager.reconnect()
+            } catch (e: Exception) {
+                Log.w(TAG, "wifiManager.reconnect() error: ${e.message}")
+            }
         }
     }
 }
