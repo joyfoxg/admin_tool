@@ -5,8 +5,8 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
-import android.net.NetworkInfo
-import android.net.wifi.WifiInfo
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.net.wifi.WifiManager
 import android.net.wifi.p2p.WifiP2pConfig
 import android.net.wifi.p2p.WifiP2pGroup
@@ -25,6 +25,7 @@ import javax.inject.Inject
 import javax.inject.Singleton
 
 private const val TAG = "WatchHotspotManager"
+private const val STARTUP_TIMEOUT_MS = 10_000L // 10초 타임아웃
 
 @Singleton
 class WatchHotspotManager @Inject constructor(
@@ -34,12 +35,15 @@ class WatchHotspotManager @Inject constructor(
         context.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
     }
 
+    private val connectivityManager: ConnectivityManager by lazy {
+        context.applicationContext.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+    }
+
     private val p2pManager: WifiP2pManager? by lazy {
         context.applicationContext.getSystemService(Context.WIFI_P2P_SERVICE) as? WifiP2pManager
     }
 
     private var p2pChannel: WifiP2pManager.Channel? = null
-    private var reservation: WifiManager.LocalOnlyHotspotReservation? = null
     private val handler = Handler(Looper.getMainLooper())
 
     private val _hotspotStatus = MutableStateFlow<HotspotStatus>(HotspotStatus.Stopped)
@@ -47,6 +51,7 @@ class WatchHotspotManager @Inject constructor(
 
     private var isP2pMode = false
     private var receiverRegistered = false
+    private var startupTimeoutRunnable: Runnable? = null
 
     private val p2pReceiver = object : BroadcastReceiver() {
         override fun onReceive(c: Context?, intent: Intent?) {
@@ -59,16 +64,18 @@ class WatchHotspotManager @Inject constructor(
                     Log.d(TAG, "WIFI_P2P_STATE_CHANGED: state=$state")
                 }
                 WifiP2pManager.WIFI_P2P_CONNECTION_CHANGED_ACTION -> {
-                    val networkInfo = intent.getParcelableExtra<NetworkInfo>(WifiP2pManager.EXTRA_NETWORK_INFO)
+                    @Suppress("DEPRECATION")
                     val p2pInfo = intent.getParcelableExtra<WifiP2pInfo>(WifiP2pManager.EXTRA_WIFI_P2P_INFO)
+                    @Suppress("DEPRECATION")
                     val group = intent.getParcelableExtra<WifiP2pGroup>(WifiP2pManager.EXTRA_WIFI_P2P_GROUP)
 
-                    Log.d(TAG, "WIFI_P2P_CONNECTION_CHANGED: isConnected=${networkInfo?.isConnected}, groupFormed=${p2pInfo?.groupFormed}")
+                    Log.d(TAG, "WIFI_P2P_CONNECTION_CHANGED: groupFormed=${p2pInfo?.groupFormed}")
 
                     if (group != null && (p2pInfo?.isGroupOwner == true || group.isGroupOwner)) {
                         val ssid = group.networkName ?: "DIRECT-Watch-Shizuku"
                         val password = group.passphrase ?: ""
                         Log.i(TAG, "Group info received via broadcast: SSID=$ssid, Pass=$password")
+                        cancelStartupTimeout()
                         _hotspotStatus.value = HotspotStatus.Running(
                             ssid = ssid,
                             password = password,
@@ -116,19 +123,37 @@ class WatchHotspotManager @Inject constructor(
         }
     }
 
+    /**
+     * ConnectivityManager 기반으로 실제 Wi-Fi STA(인프라) 연결 여부를 정확하게 판단.
+     * - 블루투스 프록시 경유 연결은 TRANSPORT_WIFI가 아니므로 오탐 방지.
+     * - deprecated WifiInfo.networkId 대신 NetworkCapabilities 사용.
+     */
     fun isConnectedToExternalWifi(): Pair<Boolean, String?> {
         try {
-            val connectionInfo: WifiInfo? = wifiManager.connectionInfo
-            if (connectionInfo != null && connectionInfo.networkId != -1) {
-                val ssid = connectionInfo.ssid?.replace("\"", "") ?: ""
-                if (ssid.isNotEmpty() && ssid != "<unknown ssid>" && ssid != "0x") {
-                    return true to ssid
-                }
+            val activeNetwork = connectivityManager.activeNetwork ?: return false to null
+            val caps = connectivityManager.getNetworkCapabilities(activeNetwork) ?: return false to null
+
+            // TRANSPORT_WIFI가 있어야 실제 Wi-Fi AP에 연결된 것
+            if (!caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
+                return false to null
             }
+
+            // Wi-Fi 연결이 확인된 경우, SSID 가져오기 시도
+            val ssid = try {
+                @Suppress("DEPRECATION")
+                val connectionInfo = wifiManager.connectionInfo
+                connectionInfo?.ssid?.replace("\"", "")?.takeIf {
+                    it.isNotEmpty() && it != "<unknown ssid>" && it != "0x"
+                }
+            } catch (e: Exception) {
+                null
+            }
+
+            return true to (ssid ?: "알 수 없는 네트워크")
         } catch (e: Exception) {
-            // Ignore
+            Log.w(TAG, "isConnectedToExternalWifi check failed", e)
+            return false to null
         }
-        return false to null
     }
 
     @SuppressLint("MissingPermission")
@@ -137,7 +162,30 @@ class WatchHotspotManager @Inject constructor(
             return
         }
 
-        // Check if Wi-Fi is currently connected to an external router
+        // [수정 3] Wi-Fi가 꺼져 있으면 자동으로 켜기 (P2P는 Wi-Fi 하드웨어 필요)
+        if (!wifiManager.isWifiEnabled) {
+            Log.i(TAG, "Wi-Fi is disabled. Enabling Wi-Fi for P2P...")
+            @Suppress("DEPRECATION")
+            val enabled = wifiManager.setWifiEnabled(true)
+            if (!enabled) {
+                _hotspotStatus.value = HotspotStatus.Failed(
+                    "Wi-Fi가 꺼져 있습니다.\n워치 설정에서 Wi-Fi를 켜고 다시 시도해 주세요."
+                )
+                return
+            }
+            // Wi-Fi가 완전히 켜질 때까지 약간 대기 후 시작
+            _hotspotStatus.value = HotspotStatus.Starting("Wi-Fi 활성화 중...")
+            handler.postDelayed({
+                proceedStartHotspot()
+            }, 1500)
+            return
+        }
+
+        proceedStartHotspot()
+    }
+
+    private fun proceedStartHotspot() {
+        // [수정 1] ConnectivityManager 기반 외부 Wi-Fi 감지
         val (isConnected, ssid) = isConnectedToExternalWifi()
         if (isConnected && ssid != null) {
             _hotspotStatus.value = HotspotStatus.Failed(
@@ -149,18 +197,88 @@ class WatchHotspotManager @Inject constructor(
         _hotspotStatus.value = HotspotStatus.Starting("브릿지 AP 생성 중...")
         Log.i(TAG, "Starting Hotspot Bridge...")
 
-        startWifiDirectGroup()
+        // [수정 5] 전체 플로우 10초 타임아웃 설정
+        scheduleStartupTimeout()
+
+        // [수정 2] 기존 P2P 그룹 정리 후 새 그룹 생성
+        cleanupAndStartWifiDirect()
     }
 
+    /**
+     * [수정 5] 타임아웃: 10초 내에 Running 상태가 되지 않으면 실패 처리
+     */
+    private fun scheduleStartupTimeout() {
+        cancelStartupTimeout()
+        startupTimeoutRunnable = Runnable {
+            if (_hotspotStatus.value is HotspotStatus.Starting) {
+                Log.e(TAG, "Startup timeout reached (${STARTUP_TIMEOUT_MS}ms). Aborting.")
+                _hotspotStatus.value = HotspotStatus.Failed(
+                    "핫스팟 시작 시간 초과 (10초)\n다시 시도해 주세요."
+                )
+                // 남은 P2P 리소스 정리
+                cleanupP2pSilently()
+            }
+        }
+        handler.postDelayed(startupTimeoutRunnable!!, STARTUP_TIMEOUT_MS)
+    }
+
+    private fun cancelStartupTimeout() {
+        startupTimeoutRunnable?.let { handler.removeCallbacks(it) }
+        startupTimeoutRunnable = null
+    }
+
+    /**
+     * [수정 2] 기존 P2P 그룹을 먼저 제거한 후 새 그룹 생성.
+     * 이전 그룹이 남아 있으면 createGroup이 BUSY(2)로 실패하는 문제 방지.
+     */
     @SuppressLint("MissingPermission")
-    private fun startWifiDirectGroup() {
+    private fun cleanupAndStartWifiDirect() {
         initP2pChannel()
         val channel = p2pChannel
         val manager = p2pManager
 
         if (manager == null || channel == null) {
-            Log.w(TAG, "WifiP2pManager unavailable, trying LocalOnlyHotspot")
-            startLocalOnlyHotspotFallback()
+            Log.e(TAG, "WifiP2pManager unavailable on this device")
+            cancelStartupTimeout()
+            _hotspotStatus.value = HotspotStatus.Failed(
+                "이 워치에서는 Wi-Fi Direct를 사용할 수 없습니다."
+            )
+            return
+        }
+
+        // 기존 그룹이 있으면 제거 후 생성, 없으면 바로 생성
+        manager.requestGroupInfo(channel) { existingGroup ->
+            if (existingGroup != null) {
+                Log.i(TAG, "Existing P2P group found (${existingGroup.networkName}). Removing first...")
+                manager.removeGroup(channel, object : WifiP2pManager.ActionListener {
+                    override fun onSuccess() {
+                        Log.d(TAG, "Old group removed. Starting new group after delay...")
+                        handler.postDelayed({
+                            startWifiDirectGroup()
+                        }, 500)
+                    }
+
+                    override fun onFailure(reason: Int) {
+                        Log.w(TAG, "Old group removal failed ($reason). Trying to create anyway...")
+                        startWifiDirectGroup()
+                    }
+                })
+            } else {
+                startWifiDirectGroup()
+            }
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun startWifiDirectGroup() {
+        val channel = p2pChannel
+        val manager = p2pManager
+
+        if (manager == null || channel == null) {
+            cancelStartupTimeout()
+            _hotspotStatus.value = HotspotStatus.Failed(
+                "Wi-Fi Direct 초기화 실패.\n앱을 재시작해 주세요."
+            )
             return
         }
 
@@ -192,6 +310,7 @@ class WatchHotspotManager @Inject constructor(
                     override fun onSuccess() {
                         Log.i(TAG, "createGroup with custom config success!")
                         isP2pMode = true
+                        cancelStartupTimeout()
                         _hotspotStatus.value = HotspotStatus.Running(
                             ssid = "DIRECT-Watch-$randomSuffix",
                             password = "12345678",
@@ -224,8 +343,17 @@ class WatchHotspotManager @Inject constructor(
             }
 
             override fun onFailure(reason: Int) {
-                Log.w(TAG, "Legacy createGroup failed (reason: $reason). Falling back to LocalOnlyHotspot...")
-                startLocalOnlyHotspotFallback()
+                // [수정 4] LocalOnlyHotspot fallback 제거 — Galaxy Watch에서는 항상 실패하므로
+                // 의미 있는 에러 메시지를 직접 표시
+                Log.e(TAG, "All createGroup attempts failed (reason: $reason)")
+                cancelStartupTimeout()
+                val reasonStr = when (reason) {
+                    WifiP2pManager.P2P_UNSUPPORTED -> "이 워치는 Wi-Fi Direct를 지원하지 않습니다."
+                    WifiP2pManager.BUSY -> "Wi-Fi가 다른 작업 중입니다.\n잠시 후 다시 시도해 주세요."
+                    WifiP2pManager.ERROR -> "Wi-Fi Direct 오류가 발생했습니다.\nWi-Fi를 껐다 켜고 다시 시도해 주세요."
+                    else -> "핫스팟 생성 실패 (코드: $reason)\nWi-Fi를 껐다 켜고 다시 시도해 주세요."
+                }
+                _hotspotStatus.value = HotspotStatus.Failed(reasonStr)
             }
         })
     }
@@ -241,6 +369,7 @@ class WatchHotspotManager @Inject constructor(
                 val password = group.passphrase ?: ""
                 Log.i(TAG, "Group active: SSID=$ssid, Passphrase=$password")
 
+                cancelStartupTimeout()
                 _hotspotStatus.value = HotspotStatus.Running(
                     ssid = ssid,
                     password = password,
@@ -250,70 +379,24 @@ class WatchHotspotManager @Inject constructor(
         }
     }
 
+    /**
+     * P2P 리소스를 조용히 정리 (에러 시 사용)
+     */
     @SuppressLint("MissingPermission")
-    private fun startLocalOnlyHotspotFallback() {
-        Log.i(TAG, "Attempting startLocalOnlyHotspot...")
+    private fun cleanupP2pSilently() {
         try {
-            wifiManager.startLocalOnlyHotspot(object : WifiManager.LocalOnlyHotspotCallback() {
-                override fun onStarted(res: WifiManager.LocalOnlyHotspotReservation) {
-                    super.onStarted(res)
-                    reservation = res
-                    isP2pMode = false
-
-                    var ssid = "Watch_Shizuku_Bridge"
-                    var password = ""
-
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                        val config = res.softApConfiguration
-                        if (config != null) {
-                            ssid = config.ssid ?: ssid
-                            password = config.passphrase ?: ""
-                        }
-                    } else {
-                        @Suppress("DEPRECATION")
-                        val config = res.wifiConfiguration
-                        if (config != null) {
-                            ssid = config.SSID ?: ssid
-                            password = config.preSharedKey ?: ""
-                        }
-                    }
-
-                    _hotspotStatus.value = HotspotStatus.Running(
-                        ssid = ssid,
-                        password = password,
-                        localIp = "192.168.49.1"
-                    )
-                }
-
-                override fun onStopped() {
-                    super.onStopped()
-                    reservation = null
-                    _hotspotStatus.value = HotspotStatus.Stopped
-                }
-
-                override fun onFailed(reason: Int) {
-                    super.onFailed(reason)
-                    reservation = null
-                    val reasonStr = when (reason) {
-                        ERROR_NO_CHANNEL -> "사용 가능한 Wi-Fi 채널이 없습니다."
-                        ERROR_GENERIC -> "핫스팟 시작 실패: 워치 Wi-Fi가 켜져 있는지 확인하세요."
-                        ERROR_INCOMPATIBLE_MODE -> "현재 Wi-Fi 모드와 호환되지 않습니다."
-                        ERROR_TETHERING_DISALLOWED -> "기기에서 핫스팟이 제한되었습니다."
-                        else -> "핫스팟 오류 (Code: $reason)"
-                    }
-                    _hotspotStatus.value = HotspotStatus.Failed(reasonStr)
-                }
-            }, handler)
-        } catch (e: SecurityException) {
-            _hotspotStatus.value = HotspotStatus.Failed("권한 오류: 위치 권한을 확인하세요.")
+            val channel = p2pChannel ?: return
+            val manager = p2pManager ?: return
+            manager.removeGroup(channel, null)
         } catch (e: Exception) {
-            _hotspotStatus.value = HotspotStatus.Failed("시작 실패: ${e.message}")
+            Log.w(TAG, "Silent P2P cleanup error: ${e.message}")
         }
     }
 
     @SuppressLint("MissingPermission")
     fun stopHotspot() {
         Log.i(TAG, "Stopping Hotspot Bridge...")
+        cancelStartupTimeout()
 
         if (isP2pMode) {
             val channel = p2pChannel
@@ -331,13 +414,6 @@ class WatchHotspotManager @Inject constructor(
             isP2pMode = false
         }
 
-        try {
-            reservation?.close()
-            reservation = null
-        } catch (e: Exception) {
-            // Ignore close errors
-        } finally {
-            _hotspotStatus.value = HotspotStatus.Stopped
-        }
+        _hotspotStatus.value = HotspotStatus.Stopped
     }
 }
