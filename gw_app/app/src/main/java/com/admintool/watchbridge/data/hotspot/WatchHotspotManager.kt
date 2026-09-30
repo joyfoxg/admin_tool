@@ -47,7 +47,6 @@ class WatchHotspotManager @Inject constructor(
 
     private var isP2pMode = false
     private var receiverRegistered = false
-    private var previousNetworkId: Int = -1
 
     private val p2pReceiver = object : BroadcastReceiver() {
         override fun onReceive(c: Context?, intent: Intent?) {
@@ -117,44 +116,40 @@ class WatchHotspotManager @Inject constructor(
         }
     }
 
+    fun isConnectedToExternalWifi(): Pair<Boolean, String?> {
+        try {
+            val connectionInfo: WifiInfo? = wifiManager.connectionInfo
+            if (connectionInfo != null && connectionInfo.networkId != -1) {
+                val ssid = connectionInfo.ssid?.replace("\"", "") ?: ""
+                if (ssid.isNotEmpty() && ssid != "<unknown ssid>" && ssid != "0x") {
+                    return true to ssid
+                }
+            }
+        } catch (e: Exception) {
+            // Ignore
+        }
+        return false to null
+    }
+
     @SuppressLint("MissingPermission")
     fun startHotspot() {
         if (_hotspotStatus.value is HotspotStatus.Running || _hotspotStatus.value is HotspotStatus.Starting) {
             return
         }
 
-        // Check if Wi-Fi is currently enabled
-        if (!wifiManager.isWifiEnabled) {
-            try {
-                @Suppress("DEPRECATION")
-                wifiManager.isWifiEnabled = true
-            } catch (e: Exception) {
-                Log.w(TAG, "Cannot enable Wi-Fi programmatically: ${e.message}")
-            }
+        // Check if Wi-Fi is currently connected to an external router
+        val (isConnected, ssid) = isConnectedToExternalWifi()
+        if (isConnected && ssid != null) {
+            _hotspotStatus.value = HotspotStatus.Failed(
+                "현재 공유기($ssid)에 연결되어 있습니다.\n워치 설정 > Wi-Fi에서 연결을 [해제] 후 시작해 주세요."
+            )
+            return
         }
 
-        _hotspotStatus.value = HotspotStatus.Starting("기존 Wi-Fi 해제 중...")
-        Log.i(TAG, "Starting Hotspot Bridge: Disconnecting current AP...")
+        _hotspotStatus.value = HotspotStatus.Starting("브릿지 AP 생성 중...")
+        Log.i(TAG, "Starting Hotspot Bridge...")
 
-        // Step 1: Disconnect from any connected router
-        try {
-            val connectionInfo: WifiInfo? = wifiManager.connectionInfo
-            if (connectionInfo != null && connectionInfo.networkId != -1) {
-                previousNetworkId = connectionInfo.networkId
-                @Suppress("DEPRECATION")
-                wifiManager.disableNetwork(previousNetworkId)
-            }
-            @Suppress("DEPRECATION")
-            wifiManager.disconnect()
-        } catch (e: Exception) {
-            Log.w(TAG, "wifiManager.disconnect() error: ${e.message}")
-        }
-
-        // Step 2: Allow chip 1.2s to settle in disconnected state before creating AP
-        handler.postDelayed({
-            _hotspotStatus.value = HotspotStatus.Starting("브릿지 AP 생성 중...")
-            startWifiDirectGroup()
-        }, 1200)
+        startWifiDirectGroup()
     }
 
     @SuppressLint("MissingPermission")
@@ -343,19 +338,6 @@ class WatchHotspotManager @Inject constructor(
             // Ignore close errors
         } finally {
             _hotspotStatus.value = HotspotStatus.Stopped
-
-            // Re-enable and reconnect previous Wi-Fi connection
-            try {
-                if (previousNetworkId != -1) {
-                    @Suppress("DEPRECATION")
-                    wifiManager.enableNetwork(previousNetworkId, false)
-                    previousNetworkId = -1
-                }
-                @Suppress("DEPRECATION")
-                wifiManager.reconnect()
-            } catch (e: Exception) {
-                Log.w(TAG, "wifiManager.reconnect() error: ${e.message}")
-            }
         }
     }
 }

@@ -1,5 +1,6 @@
 package com.admintool.watchbridge.ui.screen
 
+import android.content.Intent
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -54,6 +55,7 @@ import com.admintool.watchbridge.ui.viewmodel.WatchBridgeViewModel
 fun WatchMainScreen(
     viewModel: WatchBridgeViewModel
 ) {
+    val context = androidx.compose.ui.platform.LocalContext.current
     val hotspotStatus by viewModel.hotspotStatus.collectAsState()
     val uiState by viewModel.uiState.collectAsState()
     val scrollState = rememberScalingLazyListState()
@@ -220,6 +222,29 @@ fun WatchMainScreen(
                         Icon(imageVector = Icons.Default.WifiTetheringError, contentDescription = null, tint = WarningRed, modifier = Modifier.size(18.dp))
                         Spacer(modifier = Modifier.height(4.dp))
                         Text(text = failed.reason, fontSize = 10.sp, color = WarningRed, textAlign = TextAlign.Center)
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Button(
+                            onClick = {
+                                try {
+                                    val intent = Intent(android.provider.Settings.ACTION_WIFI_SETTINGS).apply {
+                                        flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                                    }
+                                    context.startActivity(intent)
+                                } catch (e: Exception) {
+                                    // Fallback to main settings
+                                    try {
+                                        val intent = Intent(android.provider.Settings.ACTION_SETTINGS).apply {
+                                            flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                                        }
+                                        context.startActivity(intent)
+                                    } catch (_: Exception) {}
+                                }
+                            },
+                            modifier = Modifier.fillMaxWidth().height(32.dp),
+                            colors = ButtonDefaults.buttonColors(containerColor = TealPrimary)
+                        ) {
+                            Text("⚙️ Wi-Fi 설정 열기", fontSize = 10.sp, fontWeight = FontWeight.Bold, color = Color.Black)
+                        }
                     }
                 }
             }
