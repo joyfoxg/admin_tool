@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">워치 Shizuku 브릿지</string>
+    <string name="hotspot_service_channel_name">워치 핫스팟 상태</string>
+    <string name="hotspot_running_notification">로컬 Wi-Fi 핫스팟이 실행 중입니다. 폰을 연결하세요.</string>
+</resources>
